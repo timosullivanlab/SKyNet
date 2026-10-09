@@ -1,0 +1,97 @@
+---
+title: "Import TCGA and GDC Data"
+lastupdated: "08-31-2026"
+---
+
+```{r Libraries, include = FALSE}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(tidyverse)
+library(DESeq2)
+```
+
+
+## Setup
+```{r Set Cancer Type}
+dataset <- "LIHC"
+```
+
+
+## Clinical Metadata
+Extracting the important clinical data for each patient (age, gender, alcohol, smoking).
+```{r Importing Clinical Data}
+clinical_metadata <- GDCquery_clinic(paste0("TCGA-",dataset))
+```
+
+```{r Importing Metadata from Sequencing Data}
+query_sequencing = GDCquery(
+  project = paste0("TCGA-",dataset),
+  data.category = "Transcriptome Profiling",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts",
+  data.type = "Gene Expression Quantification",
+  access = "open",
+  sample.type = "Primary Tumor"
+)
+
+sequencing_metadata <- getResults(query_sequencing)
+sequencing_metadata <- unique(sequencing_metadata, by = "cases.submitter_id")
+```
+
+``` {r Combined Clinical Metadata}
+combined_metadata <- merge(clinical_metadata, sequencing_metadata,
+                       by.x = 'submitter_id',
+                       by.y = 'cases.submitter_id'
+)
+
+combined_metadata <- select(combined_metadata, where(~ !is.list(.)))
+```
+
+
+## Bulk RNA Seq Counts
+Importing the bulk RNA sequencing counts matrix.
+```{r Importing Counts Matrix}
+query_counts <- GDCquery(
+  project = paste0("TCGA-", dataset),
+  data.category = "Transcriptome Profiling",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts",
+  data.type = "Gene Expression Quantification",
+  access = "open",
+  barcode = combined_metadata$cases,
+)
+
+# Downloading data from GDC (Will take a while)
+GDCdownload(query_counts)
+
+tcga_data <- GDCprepare(query_counts)
+
+# ENSEMBL gene and tumor sample metadata
+gene_metadata <- as.data.frame(rowData(tcga_data))
+```
+
+```{r Normalizing Counts Matrix}
+counts_matrix <- assay(tcga_data, "unstranded")
+
+col_data <- as.data.frame(colData(tcga_data))
+col_data <- subset(col_data, select = -c(treatments, primary_site, disease_type))
+
+deseq_dataset <- DESeqDataSetFromMatrix(countData = counts_matrix,
+                                        colData = col_data,
+                                        design = ~ 1)
+
+# removing the genes with less than 10 reads across all samples 
+deseq_dataset <- deseq_dataset[rowSums(counts(deseq_dataset)) >= 10, ]
+
+# variance stabilizing transformation to normalize count data 
+vst_counts_matrix <- as.data.frame(assay(vst(deseq_dataset, blind = FALSE)))
+```
+
+
+## Output CSV Data Files
+```{r Outputs}
+write.csv(vst_counts_matrix, paste0(dataset, "_counts.csv"))
+write.csv(gene_metadata, paste0(dataset, "_gene_metadata.csv"))
+write.csv(combined_metadata, paste0(dataset, "_clinical.csv"))
+```
+

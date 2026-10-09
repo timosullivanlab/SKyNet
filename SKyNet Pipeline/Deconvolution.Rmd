@@ -1,0 +1,709 @@
+---
+title: "Bulk RNA Sequencing Deconvolution"
+lastupdated: "08-31-2026"
+---
+
+```{r Libraries, include = FALSE}
+library(survival)
+library(survminer)
+library(tidyverse)
+library(pheatmap)
+library(grid)
+library(forestplot)
+library(parallel)
+```
+
+
+## Import Data
+First, import the necessary data to run this pipeline. The clinical data, counts, and gene metadata were imported from TCGA using the **import_data.Rmd** script. The clinical data contains patient information about age, survival, etc., while the counts are the bulk RNA sequencing samples from their tumors. The gene metadata is used to match ENSEMBL IDs to common gene names.
+
+Lineage markers were extracted from our lab's scRNA-seq clustering of publicly available cancer datasets. We extract top 20 differentially expressed markers from each cell type.
+
+```{r Import Data}
+cancer <- 'LIHC'
+
+clinical_data <- read.csv(paste0(cancer, "_clinical.csv"), row.names = 1)
+counts <- read.csv(paste0(cancer, "_counts.csv"), row.names = 1)
+gene_metadata <- read.csv("BLCA_gene_metadata.csv", row.names = 1)
+lineage_markers <- read.csv("Common_Lineage_Markers.csv") |>
+  mutate(across(where(is.character), trimws))
+```
+
+## High Versus Low Expression of a Gene List
+Stratify patients into high and low expression of `gene_list` by ranking by
+each gene and taking the mean rank. Plot a heatmap of selected patient
+expression of `gene_list`. Run a Kaplan-Meier survival analysis comparing patients
+that are high versus low in expression of `gene_list`. Returns p value and how
+big the difference was. If the difference is positive, the high group had better
+survival. If the difference is negative, the low group had better survival.
+
+```{r Define Single Lineage Function}
+singleLineage <- function(gene_module, gene_list, clinical = clinical_data, makeHeatMap = FALSE, HR = FALSE) {
+  
+  # Code for TCGA Data
+  # Ensuring consistent genes between datasets ----
+  # Make sure all genes are in gene metadata
+  valid_ensembl <- rownames(gene_metadata[gene_metadata$gene_name %in% gene_list,])
+
+  # Make sure all genes are in bulk RNA seq
+  valid_ensembl <- intersect(valid_ensembl, rownames(counts))
+  desired_counts <- counts[valid_ensembl,]
+
+  if (length(valid_ensembl) < 1) {
+    return(c(1, 0))
+  }
+
+  desired_counts$gene_name <- gene_metadata[valid_ensembl, "gene_name"]
+  rownames(desired_counts) <- NULL
+  
+  desired_counts <- desired_counts |>
+    distinct(gene_name, .keep_all = T) |>
+    column_to_rownames("gene_name")
+  
+  # Ranking patients by gene expression ----
+  ranked_counts <- apply(desired_counts, 1, function(x) rank(-x, ties.method = "first"))
+  
+  # get the mean rank for each patient
+  mean_rank <- rowMeans(ranked_counts)
+  
+  # get the upper and lower quartiles
+  upper <- names(mean_rank)[mean_rank <= quantile(mean_rank, 0.25)]
+  lower <- names(mean_rank)[mean_rank >= quantile(mean_rank, 0.75)]
+  
+  # Generating heatmap ----
+  if (makeHeatMap) {
+    heatmap_values <- cbind(ranked_counts, mean = mean_rank)
+    heatmap_values <- t(heatmap_values[order(heatmap_values[,"mean"], decreasing = TRUE),
+                                       -ncol(heatmap_values)])
+    ngenes = nrow(heatmap_values)
+    brewer_palette <- "RdBu"
+    ramp <- colorRampPalette(RColorBrewer::brewer.pal(11, brewer_palette))
+    mr <- ramp(256)[256:1]
+    pheatmap::pheatmap(heatmap_values, labCol = NA, color = mr, scale = "row", 
+                       fontsize_col = 10, fontsize_row = 200/ngenes, fontsize = 15, 
+                       border_color = NA, show_colnames=FALSE, cluster_rows=FALSE,
+                       cluster_cols=FALSE, main=gene_module)
+  }
+  
+  # Kaplan-Meier ----
+  # adding the significant counts data for patients (high and low) together 
+  combined_patients <- data.frame(
+    patients = c(upper, lower),
+    stratum = rep(c("HIGH", "LOW"), c(length(upper), length(lower)))
+  )
+  
+  # formatting patient labels to match clinical data
+  combined_patients$patients <- gsub("\\.", "-", combined_patients$patients)
+  
+  # clinical data for high and low patients
+  combined_patients <- merge(combined_patients, clinical, by.x = 'patients', by.y = 'cases')
+  
+  # adding a column for whether the patient is dead or not 
+  combined_patients$deceased <- ifelse(combined_patients$vital_status == "Alive", FALSE, TRUE)
+  
+  # Overall survival (for TCGA data)
+  combined_patients$overall_survival <- ifelse(combined_patients$deceased == TRUE,
+                                               combined_patients$days_to_death,
+                                               combined_patients$days_to_last_follow_up)
+  
+  final_plot_data <- as.data.frame(combined_patients)
+  
+  # Returning hazard ratio instead
+  if (HR) {
+    fit <- coxph(
+      Surv(overall_survival, deceased) ~ stratum,
+      data = final_plot_data
+    )
+    
+    pval <- round(summary(fit)$coefficients["stratumLOW", "Pr(>|z|)"], 4)
+    
+    hr <- (exp(coef(fit))[1])
+    
+    ci <- exp(confint(fit)["stratumLOW", ])
+    ci_lower <- round(ci[1], 3)
+    ci_upper <- round(ci[2], 3)
+    
+    return(c(hr, ci_lower, ci_upper, pval))
+  }
+  
+  # fitting survival curve
+  fit <- survminer::surv_fit(Surv(overall_survival, deceased) ~ stratum, data = final_plot_data)
+  
+  # Outputs ----
+  pval <- surv_pvalue(fit)$pval
+  
+  rmean_high <- summary(fit, rmean = "common")$table[, "rmean"][1]
+  rmean_low <- summary(fit, rmean = "common")$table[, "rmean"][2]
+  
+  survival_dif <- (rmean_high - rmean_low)
+  
+  return(c(pval, survival_dif))
+}
+```
+
+```{r Run Single Lineage Function}
+singleLineage(gene_module = "NK Markers", gene_list = lineage_markers$Mature.NK,
+              makeHeatMap = TRUE)
+```
+
+
+## High Versus Low Expression of All Cell Types
+The `singleLineage()` evaluates whether patients high in a specific cell type
+have better or worse survival than patients low in that cell type. This function
+ranks cell types within a specific cancer by plotting the p value (magnitude)
+and mean survival difference (direction).
+
+```{r Define Lineage Heat Map Function}
+LineageHeatMap <- function(lineage) {
+  
+  pvalues <- numeric(0)
+  
+  for (i in 1:ncol(lineage)) {
+    
+    # Subset the name of one cell type
+    cell <- colnames(lineage)[i]
+    
+    # Draw lineage markers for that cell type
+    markers <- lineage[,i]
+    
+    # Run singleLineage() on cell type
+    result <- singleLineage(gene_module = cell, gene_list = markers,
+                            makeHeatMap = FALSE)
+    
+    
+    # Extracting p value (magnitude) and mean difference (direction)
+    pval <- result[1]
+    mean_dif <- result[2]
+    
+    # Identify if high cell population is good or bad
+    if (mean_dif > 0) {
+      pvalues <- c(pvalues, (-log10(pval)))
+    } else {
+      pvalues <- c(pvalues, (log10(pval)))
+    }
+  }
+  
+  # Creating the matrix for the heatmap that has each cell and its pval
+  plot_data <- matrix(pvalues, ncol = 1, dimnames = list(colnames(lineage), "p-val"))
+  
+  # ordering the matrix
+  plot_data <- plot_data[order(plot_data[,1], decreasing = TRUE), , drop = FALSE]
+  
+  
+  # plotting the heatmap 
+  title <- paste("All cells in", cancer)
+  
+  brewer_palette <- "RdBu"
+  ramp <- colorRampPalette(RColorBrewer::brewer.pal(5, brewer_palette))
+  mr <- ramp(1000)[1000:1]
+  rg <- 3
+  
+  plot <- pheatmap::pheatmap(plot_data, labCol = NA, color = mr, scale = "none",
+                             fontsize_col = 10, fontsize_row = 10, fontsize = 15,
+                             border_color = NA, show_rownames = TRUE,
+                             show_colnames=FALSE, cluster_rows=FALSE,
+                             cluster_cols=FALSE, main = title, display_numbers = TRUE,
+                             number_format = "%.5f", number_color = "Black",
+                             breaks = seq(-rg, rg, length.out = 1000))
+  
+  return(plot)
+}
+```
+
+
+```{r Run Lineage Heat Map Function}
+plot <- LineageHeatMap(lineage_markers)
+
+ggsave(filename = paste0(cancer, '_single_lineage.pdf'), plot = plot, dpi = 300,
+       units = 'in', width = 8, height = 12)
+```
+
+## High/High Versus Low/Low or High not High Expression of Two Gene Lists
+First, we use `stratifyPatients()` to label HIGH and LOW patients in each cell
+type. The `ratio` parameter is the percentile that we would like to deem as high
+or low. The default is 0.25, which takes the top quartile as HIGH and the bottom
+quartile as LOW.
+
+The `HighHighLowLow()` command identifies synergistic interactions between two
+cell types by comparing patients that are high in both cell types to patients
+that are low in both cell types. Then we find patients that are HIGH in both
+and compare them to patients that are LOW in both using a Kaplan-Meier survival
+analysis (same as `runSingleLineage()`). The function returns the p value and
+the mean difference in survival.
+
+The `HighNotHigh()` command identifies the baseline effect of each cell type
+in the absence of the other cell type. It subsets for when one cell type gene
+list is high and the other cell type is not high. Then the same Kaplan-Meier
+survival analysis is run, and the function returns the p value and mean
+difference in survival.
+
+```{r Define Stratify Patients Helper Function}
+stratifyPatients <- function(gene_list) {
+  
+  valid_ensembl <- rownames(gene_metadata[gene_metadata$gene_name %in% gene_list,])
+
+  # Make sure all genes are in bulk RNA seq
+  valid_ensembl <- intersect(valid_ensembl, rownames(counts))
+  desired_counts <- counts[valid_ensembl,]
+
+  if (length(valid_ensembl) < 1) {
+    return(c(1, 0))
+  }
+
+  desired_counts$gene_name <- gene_metadata[valid_ensembl, "gene_name"]
+  rownames(desired_counts) <- NULL
+  
+  desired_counts <- desired_counts |>
+    distinct(gene_name, .keep_all = T) |>
+    column_to_rownames("gene_name")
+  
+  # Ranking patients by gene expression ----
+  # order patients
+  ranked_counts <- apply(desired_counts, 1, function(x) rank(-x, ties.method = "first"))
+  
+  # adding the mean rank across all rows 
+  mean_rank <- rowMeans(ranked_counts)
+  
+  # upper and lower quartiles
+  upper <- names(mean_rank[mean_rank <= quantile(mean_rank, 0.25)])
+  lower <- names(mean_rank[mean_rank >= quantile(mean_rank, 0.75)])
+  
+  # Compiling clinical and counts data for the high and low patients ----
+  # adding the significant counts data for patients (high and low) together
+  combined_patients <- data.frame(
+    patients = c(upper, lower),
+    stratum = rep(c("HIGH", "LOW"), c(length(upper), length(lower)))
+  )
+  
+  # formatting patient labels to match clinical data
+  combined_patients$patients <- gsub("\\.", "-", combined_patients$patients)
+  
+  # adding clinical data to counts data
+  combined_patients <- merge(combined_patients, clinical_data, by.x = 'patients', by.y = 'cases')
+  
+  # adding a column for whether the patient is dead or not 
+  combined_patients$deceased <- ifelse(combined_patients$vital_status == "Alive", FALSE, TRUE)
+  
+  # Overall survival (for TCGA data)
+  combined_patients$overall_survival <- ifelse(combined_patients$deceased == TRUE,
+                                               combined_patients$days_to_death,
+                                               combined_patients$days_to_last_follow_up)
+  
+  # exporting the final data to be used for plot 
+  final_plot_data <- as.data.frame(combined_patients)
+  
+  return (final_plot_data)
+}
+```
+
+#### High High Low Low
+```{r Define High High Low Low Function}
+HighHighLowLow <- function(gene_list1, gene_list2) {
+  
+  # Extract HIGH and LOW patients for both gene lists
+  cell1_patients <- stratifyPatients(gene_list = gene_list1)
+  
+  cell1_upper <- cell1_patients[cell1_patients$stratum == "HIGH", ]
+  cell1_lower <- cell1_patients[cell1_patients$stratum == "LOW", ]
+  
+  cell2_patients <- stratifyPatients(gene_list = gene_list2)
+  
+  cell2_upper <- cell2_patients[cell2_patients$stratum == "HIGH", ]
+  cell2_lower <- cell2_patients[cell2_patients$stratum == "LOW", ]
+  
+  # Identify patients that are HIGH or LOW in both gene lists
+  high_high <- cell1_upper[cell1_upper$patients %in% intersect(cell1_upper$patients, cell2_upper$patients), ]
+  low_low <- cell1_lower[cell1_lower$patients %in% intersect(cell1_lower$patients, cell2_lower$patients), ]
+  
+  # Check for conditions: if either group has too little patients (<15) OR
+  # there is a big difference in HIGH/HIGH vs LOW/LOW populations, return
+  # no significance.
+  if (nrow(high_high) < 15 || nrow(low_low) < 15) {
+    return (c(1, 0))
+  }
+  
+  if (abs(nrow(high_high) - nrow(low_low)) > 0.20*(nrow(high_high))) {
+    return (c(1, 0))
+  }
+
+  # Collate all relevant patients for analysis
+  final_plot_data <- as.data.frame(rbind(high_high, low_low))
+  
+  # Run Kaplan-Meier Survival Analysis ----
+  fit <- survminer::surv_fit(Surv(overall_survival, deceased) ~ stratum, data = final_plot_data)
+  
+  pval <- surv_pvalue(fit)$pval
+  
+  rmean_high <- as.numeric(summary(fit, rmean = "common")$table[, "rmean"][1])
+  rmean_low <- as.numeric(summary(fit, rmean = "common")$table[, "rmean"][2])
+  
+  mean_dif <- (rmean_high - rmean_low)
+
+  return(c(pval, mean_dif))
+}
+```
+
+#### High Not High
+```{r Define High Not High Function}
+HighNotHigh <- function(gene_list1, gene_list2) {
+  
+  # Extract HIGH and LOW patients for both gene lists
+  cell1_patients <- stratifyPatients(gene_list = gene_list1)
+  
+  cell1_upper <- cell1_patients[cell1_patients$stratum == "HIGH", ]
+  cell1_lower <- cell1_patients[cell1_patients$stratum == "LOW", ]
+  
+  cell2_patients <- stratifyPatients(gene_list = gene_list2)
+  
+  cell2_upper <- cell2_patients[cell2_patients$stratum == "HIGH", ]
+  cell2_lower <- cell2_patients[cell2_patients$stratum == "LOW", ]
+  
+  # Identify patients that are HIGH or LOW in both gene lists
+  high_nothigh <- cell1_upper[!(cell1_upper$patients %in% cell2_upper$patients), ]
+  low_notlow <- cell1_lower[!(cell1_lower$patients %in% cell2_lower$patients), ]
+  
+  # Check for conditions: if either group has too little patients (<15) OR
+  # there is a big difference in HIGH/HIGH vs LOW/LOW populations, return
+  # no significance.
+  if (nrow(high_nothigh) < 15 || nrow(low_notlow) < 15) {
+    return (c(1, 0))
+  }
+  
+  if (abs(nrow(high_nothigh) - nrow(low_notlow)) > 0.20*(nrow(high_nothigh))) {
+    return (c(1, 0))
+  }
+
+  # Collate all relevant patients for analysis
+  final_plot_data <- as.data.frame(rbind(high_nothigh, low_notlow))
+  
+  # Run Kaplan-Meier Survival Analysis ----
+  fit <- survminer::surv_fit(Surv(overall_survival, deceased) ~ stratum, data = final_plot_data)
+  
+  pval <- surv_pvalue(fit)$pval
+  
+  rmean_high <- as.numeric(summary(fit, rmean = "common")$table[, "rmean"][1])
+  rmean_low <- as.numeric(summary(fit, rmean = "common")$table[, "rmean"][2])
+  
+  mean_dif <- (rmean_high - rmean_low)
+
+  return(c(pval, mean_dif))
+}
+```
+
+
+## High/High Low/Low Versus High Not High Combinations of Two Cell Types
+`TwoLineageHeatMapHHLL()` evaluates whether patients HIGH in both cell types
+survive better than patients LOW in both cell types within a specific cancer.
+This can be plotted on a heatmap of all interactions between all cell types
+within the tumor.
+
+```{r Define Two Lineage High High Low Low Matrix}
+TwoLineageMatrixHHLL <- function(lineage) {
+  
+  # result matrix to store all the p-values 
+  result_matrix <- matrix(nrow = ncol(lineage), ncol = ncol(lineage),
+                          dimnames = list(colnames(lineage), colnames(lineage)))
+  
+  for(i in 1:ncol(lineage)) {
+    for (j in i:ncol(lineage)) {
+      module1 <- names(lineage)[i]
+      module2 <- names(lineage)[j]
+      lineage1 <- lineage[, module1]
+      lineage2 <- lineage[,module2]
+      
+      results <- HighHighLowLow(gene_list1 = lineage1, gene_list2 = lineage2)
+      
+      pval <- -log10(as.numeric(results[1]))
+      mean_dif <- results[2]
+      
+      if(mean_dif < 0) {
+        pval = -pval
+      }
+      
+      result_matrix[i,j] <- pval
+      result_matrix[j,i] <- pval
+    }
+  }
+  
+  # adding NA values in the diagonal (same cell x same cell)
+  diag(result_matrix) <- NA
+  
+  return(result_matrix)
+}
+```
+
+```{r Run Two Lineage High High Low Low Matrix}
+hhll <- TwoLineageMatrixHHLL(lineage = lineage_markers)
+```
+
+```{r Plot Two Lineage High/High Low/Low Heat Map}
+annotated_matrix <- matrix("", nrow = nrow(hhll), ncol = ncol(hhll))
+annotated_matrix[abs(hhll) > -log10(0.05)] <- "*"
+annotated_matrix[abs(hhll) > -log10(0.01)] <- "**"
+annotated_matrix[abs(hhll) > -log10(0.001)] <- "***"
+
+ramp <- colorRampPalette(RColorBrewer::brewer.pal(5, "RdBu"))
+mr <- ramp(1000)[1000:1]
+title <- paste0(cancer, " High/High vs Low/Low")
+
+plot <- pheatmap::pheatmap(hhll, color = mr, fontsize_col = 7, fontsize_row = 7,
+                           border_color = NA, cluster_rows = FALSE, cluster_cols = FALSE,
+                           main = title, display_numbers = annotated_matrix,
+                           number_format = "%.5f", breaks = seq(-3, 3, length.out = 1000))
+
+ggsave(filename = paste0(cancer, '_hihi_lowlow_heatmap.pdf'), plot = plot, dpi = 300, units = 'in',
+       width = 12, height = 12)
+```
+
+# High Not High
+`TwoLineageHeatMapHNH()` runs the same matrix as HHLL, but on patients that are
+high in one cell type and not high in the other.
+```{r Define Two Lineage High Not High Matrix}
+TwoLineageMatrixHNH <- function(lineage) {
+  
+  # result matrix to store all the p-values 
+  result_matrix <- matrix(nrow = ncol(lineage), ncol = ncol(lineage),
+                          dimnames = list(colnames(lineage), colnames(lineage)))
+  for(i in 1:ncol(lineage)) {
+    for (j in 1:ncol(lineage)) {
+      module1 <- names(lineage)[i]
+      module2 <- names(lineage)[j]
+      lineage1 <- lineage[, module1]
+      lineage2 <- lineage[,module2]
+      
+      results <- HighNotHigh(gene_list1 = lineage1, gene_list2 = lineage2)
+      
+      pval <- -log10(as.numeric(results[1]))
+      mean_dif <- results[2]
+      
+      # positive if mean_dif > 0, negative if mean_dif < 0
+      result_matrix[i,j] <- pval * sign(mean_dif)
+    }
+  }
+  
+  # adding NA values in the diagonal (same cell x same cell)
+  diag(result_matrix) <- NA
+  
+  return(result_matrix)
+}
+```
+
+```{r Run High Not High Matrix}
+hnh <- TwoLineageMatrixHNH(lineage = lineage_markers)
+```
+
+# Categorized Interactions
+The purpose of `TwoLineageMatrixHHLL()` and `TwoLineageMatrixHNH()` is to
+determine which cell type drives the interaction. For instance, say that
+patients with high levels of two cell types have better survival. If patients
+also have better survival when one of the cell types is high while the other
+one is not, the high cell type is probably the one driving the positive effect
+on survival.
+
+Using this logic, we create a categorized interactions heat map which plots
+which cell is responsible for driving the effect on survival.
+```{r Define Categorized Interactions Function}
+PlotCategorizedInteractions <- function(hhll, hnh, threshold = -log10(0.05)) {
+  n <- nrow(hhll)
+  
+  # Initialize result_matrix with 0s
+  result_matrix <- matrix(0, nrow = n, ncol = n, dimnames = dimnames(hhll))
+  
+  # Loop over all i, j combinations
+  for (i in 1:n) {
+    for (j in 1:n) {
+      
+      # a is the combined interaction, b is high in cell 1 only, c is high in cell 2 only
+      a <- hhll[i, j]
+      b <- hnh[i, j]
+      c <- hnh[j, i]
+      
+      # Skip if any required value is NA
+      if (is.na(a) || is.na(b) || is.na(c)) next
+      
+      sig_a <- abs(a) > threshold
+      sig_b <- abs(b) > threshold
+      sig_c <- abs(c) > threshold
+      
+      
+      # If only cell A is significant, cell A drives
+      if (sig_a && sig_b && !sig_c) {
+        result_matrix[i, j] <- 1
+      }
+      # If only cell B is significant, cell B drives
+      else if (sig_a && !sig_b && sig_c) {
+        result_matrix[i, j] <- 2
+      }
+      # If neither cell is significant, they work together
+      else if (sig_a && !sig_b && !sig_c) {
+        result_matrix[i, j] <- 3
+      } 
+      # If the combination takes away the significance of both cells or the 
+      # one of the cells is significant in the wrong direction
+      else if ((!sig_a && sig_b && sig_c) || ((a * b < 0) && sig_a && sig_b && sig_c) ||
+               ((a * c < 0) && sig_a && sig_b && sig_c)) {
+        result_matrix[i, j] <- 4 # mutually antagonistic
+      }
+    }
+  }
+  
+  diag(result_matrix) <- NA
+  
+  # Define breaks for values -4 to 4
+  breaks <- c(-0.5, 0.5, 1.5, 2.5, 3.5, 4.5)
+  
+  # Define colors for each category (-4 to 4)
+  colors <- c(  
+    "white",        # 0
+    "navy",       # 1
+    "firebrick4",        # 2
+    "goldenrod1", #3
+    "chartreuse3") 
+  
+  
+  legend_breaks <- c(0,1,2,3,4)
+  legend_labels <- c("", "Cell 1 Drives", "Cell 2 Drives", "Synergistic", "Antagonistic")
+  
+  title <- paste0(cancer, " Categorized Interactions")
+  
+  # Plot heatmap
+  plot <- pheatmap::pheatmap(result_matrix, color = colors, breaks = breaks,
+                             cluster_rows = FALSE, cluster_cols = FALSE,
+                             legend_breaks = legend_breaks, legend_labels = legend_labels,
+                             display_numbers = FALSE, main = title, fontsize_col = 7,
+                             fontsize_row = 7, border_color = "grey")
+  return(plot)
+}
+```
+
+```{r Run Categorized Interactions}
+p <- PlotCategorizedInteractions(hhll, hnh)
+
+ggsave(file = paste0(cancer, '_marginal_effects.pdf'), plot = p, dpi = 300, units = 'in',
+       width = 12, height = 12)
+```
+
+
+# Forest Plot
+For the forest plot, we compare the hazard ratios of each cell type. As
+explained previously, a larger hazard ratio corresponds to better survival for
+the high group, while a lower hazard ratio means worse survival. The forest plot
+shows the confidence intervals for the hazard ratios of each cell type, along
+with listing the p value and false discovery rate (FDR).
+
+```{r Permutation Test}
+permuteSingleLineage <- function(cell) {
+  baseline <- log(singleLineage(gene_list = lineage_markers[[cell]], HR = TRUE)[1])
+  
+  F_emp <- numeric(0)
+  
+  for (i in 1:1000) {
+    shuffled_clinical <- clinical_data
+    shuffled_clinical$cases <- sample(shuffled_clinical$cases)
+    
+    F_emp[i] <- log(singleLineage(gene_list = lineage_markers[[cell]], clinical = shuffled_clinical, HR = TRUE)[1])
+  }
+  
+  return(mean(abs(F_emp) >= abs(baseline), na.rm = T))
+}
+```
+
+```{r}
+singleLineageForestPlot <- function(lineage) {
+  
+  nThreads <- detectCores() - 1
+  cl <- makeCluster(nThreads)
+  
+  clusterSetRNGStream(cl, iseed = 777)
+  
+  clusterExport(cl, varlist = c("singleLineage", "permuteSingleLineage", 
+                                "clinical_data", "lineage_markers", 
+                                "counts", "gene_metadata"))
+  
+  clusterEvalQ(cl, {
+    library(survival) 
+    library(tidyverse)
+  })
+  
+  cells <- colnames(lineage)
+  temp <- parLapply(cl, cells, function(cell) {
+    result <- singleLineage(gene_list = lineage[[cell]], HR = TRUE)
+    permuted_p <- permuteSingleLineage(cell)
+    return(c(cell, result[1:3], permuted_p))
+  })
+  
+  stopCluster(cl)
+  
+  # --- Data Formatting ---
+  result_matrix <- as.data.frame(do.call(rbind, temp))
+  
+  colnames(result_matrix) <- c("cell", "HR", "ci_lower", "ci_upper", "pval")
+  
+  result_matrix$HR <- 1/as.numeric(result_matrix$HR)
+  result_matrix$pval <- as.numeric(result_matrix$pval)
+  result_matrix$ci_lower <- 1/as.numeric(result_matrix$ci_lower)
+  result_matrix$ci_upper <- 1/as.numeric(result_matrix$ci_upper)
+  result_matrix$padj <- p.adjust(result_matrix$pval, method = "BH")
+  
+  result_matrix <- result_matrix %>% 
+    arrange(desc(HR)) %>% 
+    filter(pval < 0.05)
+
+  # --- Plotting Preparation ---
+  estimates <- matrix(c(NA, round(result_matrix$HR, 3)), ncol = 1)
+  lower <- matrix(c(NA, round(result_matrix$ci_lower,3)), ncol = 1)
+  upper <- matrix(c(NA, round(result_matrix$ci_upper,3)), ncol = 1)
+  
+  formatted_pval <- ifelse(result_matrix$pval < 0.001, "< 0.001", round(result_matrix$pval,3))
+  formatted_padj <- ifelse(result_matrix$padj < 0.001, "< 0.001", round(result_matrix$padj,3))
+  
+  tabletext <- cbind(
+    c("Cell", result_matrix$cell),
+    c("HR (95% CI)", paste0(round(as.numeric(result_matrix$HR),3), " (",
+                            round(as.numeric(result_matrix$ci_upper),3), "–",
+                            round(as.numeric(result_matrix$ci_lower),3), ")")),
+    c("P-value", formatted_pval)
+  )
+  
+  colnames(tabletext) <- c("Cell", "HR[95%CI]", "pval")
+  tabletext <- as.matrix(tabletext)
+  
+  grid.newpage()
+  pushViewport(viewport(layout = grid.layout(1, 1,
+                                             widths = unit(1, "npc"),
+                                             heights = unit(1, "npc"),
+                                             respect = TRUE,
+                                             just = "center"
+  )))
+  
+  # --- Final Plot ---
+  forestplot(
+    labeltext = as.matrix(tabletext),
+    mean  = estimates,
+    lower = upper,
+    upper = lower,
+    zero  = 1,
+    xlog  = FALSE,
+    boxsize = 0.4,
+    col = forestplot::fpColors(box = "black", line = "black", summary = "black"),
+    lineheight = unit(0.8, "cm"),
+    xticks = c(0, 0.5, 1, 1.5, 2, 2.5, 3),
+    xlab = "HR",
+    txt_gp = fpTxtGp(
+      label = gpar(cex = 0.8),   # row labels
+      xlab  = gpar(cex = 0.9),
+      ticks = gpar(cex = 0.8)
+    )
+  )
+}
+```
+
+R Markdown doesn't like this code, so take the function below and paste it into your console. Then, you can Export as a PDF.
+```{r}
+### COPY THIS INTO YOUR CONSOLE
+before <- Sys.time()
+singleLineageForestPlot(lineage = lineage_markers)
+after <- Sys.time()
+print(after-before)
+print(cancer)
+```

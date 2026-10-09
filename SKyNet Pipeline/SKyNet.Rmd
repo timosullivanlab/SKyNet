@@ -1,0 +1,511 @@
+---
+title: "SKYNET Ligand Receptor Analysis"
+lastupdated: "2026-08-31"
+---
+
+```{r Libraries, include = FALSE, echo = FALSE}
+library(survival)
+library(survminer)
+library(tidyverse)
+library(parallel)
+```
+
+## Import Data
+
+First, import the necessary data to run this pipeline. The clinical data and counts were imported from TCGA using the **import_data.Rmd** script. The clinical data contains patient information about age, survival, etc., while the counts are the bulk RNA sequencing samples from their tumors.
+
+Lineage markers were extracted from scRNA-seq clustering of publicly available cancer datasets. scRNA-seq expression data for each cell type (average and percent expression) from each cancer are used to validate expression. Both were extracted from Seurat objects using the **scrna_extraction.Rmd** script.
+
+Finally, we load the list of documented ligand-receptor interactions from scDiffCom and filter for interactions whose genes are present in the data.
+
+```{r Load Data}
+set.seed(777)
+
+# TCGA
+cancer <- 'LIHC'
+clinical_data <- read.csv(paste0(cancer, "_clinical.csv"), row.names = 1)
+bulk_counts <- read.csv(paste0(cancer, "_counts.csv"), row.names = 1)
+gene_metadata <- read.csv("BLCA_gene_metadata.csv", row.names = 1)
+
+# Cleaning up data - converting ENSEMBL names to standard gene names
+bulk_counts <- bulk_counts |>
+  rownames_to_column("gene_id") |>
+  mutate(gene_name = gene_metadata[gene_id, "gene_name"]) |>
+  distinct(gene_name, .keep_all = TRUE) |>
+  column_to_rownames("gene_name") |>
+  select(-gene_id) |>
+  rename_with(~ str_replace_all(.x, "\\.", "-"))
+
+# Single Cell
+lineage_markers <- read.csv(paste0(cancer, "_Lineage_Markers.csv"))
+sc_tot_pct_exp <- read.csv(paste0(cancer, "_pct_exp.csv"), header = TRUE, row.names = 1)
+sc_tot_avg_exp <- read.csv(paste0(cancer, "_avg_exp.csv"), header = TRUE, row.names = 1)
+
+# Matching Data
+shared_celltypes <- Reduce(intersect, list(colnames(lineage_markers), colnames(sc_tot_pct_exp), colnames(sc_tot_avg_exp)))
+shared_patients <- intersect(clinical_data$cases, colnames(bulk_counts))
+
+lineage_markers <- lineage_markers[, shared_celltypes]
+sc_tot_pct_exp <- sc_tot_pct_exp[, shared_celltypes]
+sc_tot_avg_exp <- sc_tot_avg_exp[, shared_celltypes]
+
+clinical_data <- clinical_data |>
+  filter(cases %in% shared_patients) |>
+  mutate(
+    deceased = vital_status != "Alive",
+    overall_survival = ifelse(deceased, days_to_death, days_to_last_follow_up)
+  )
+
+bulk_counts <- bulk_counts[, shared_patients, drop = F]
+
+
+# Ligand Receptor Interaction Matrix (scDiffCom)
+lr_network <- as.data.frame(readRDS("lr_scdiffcom_v2.rds"))
+
+valid_names <- rownames(bulk_counts)
+lr_network <- lr_network |>
+  filter(if_all(2:6, ~ is.na(.x) | .x %in% valid_names))
+
+# Add combined ligand and receptor name columns
+lr_network <- as.data.frame(lr_network) |>
+  rowwise() |>
+  mutate(
+    ligand   = str_c(sort(na.omit(c_across(2:3))), collapse = "_"),
+    receptor = str_c(sort(na.omit(c_across(4:6))), collapse = "_")
+  ) |>
+  ungroup()
+```
+
+# Ligand Lineage
+
+This code identifies which genes are significant for survival in each cell type. First, we identify the top ratio of patients that are high in a cell type. We take this subset and rank them on the expression of a specific gene. If there is a significant survival difference between high and low ligand expression among patients high in the cell type of interest, we infer that high expression of the ligand in the presence of the cell type correlates with survival.
+
+```{r Define Lineage Ligand Score}
+getStratifiedPatients <- function(cell_lineage, ligand_name) {
+  
+  valid_genes_1 <- intersect(cell_lineage, rownames(bulk_counts))
+  if (length(valid_genes_1) < 1) return(NA)
+  
+  # Ranking patients by cell lineage marker expression
+  desired_counts <- bulk_counts[valid_genes_1, , drop = FALSE]
+  ranked_lineage <- apply(desired_counts, 1, function(x) rank(-x, ties.method = "first"))
+  mean_rank <- rowMeans(ranked_lineage)
+  
+  # identify top 25% patients in cell type
+  high_celltype_index <- mean_rank <= quantile(mean_rank, 0.25)
+  high_celltype <- bulk_counts[ , high_celltype_index, drop = FALSE]
+  
+  # Ranking patients by ligand expression
+  valid_genes_2 <- intersect(ligand_name, rownames(bulk_counts))
+  if (length(valid_genes_2) < 1) return(NA)
+  
+  high_celltype <- high_celltype[valid_genes_2, , drop = FALSE]
+  ranked_ligand <- apply(high_celltype, 1, function(x) rank(-x, ties.method = "first"))
+  mean_rank_ligand <- rowMeans(ranked_ligand)
+  
+  # Identify HIGH and LOW populations
+  high_ligand_index <- mean_rank_ligand <= quantile(mean_rank_ligand, 0.25)
+  low_ligand_index <- mean_rank_ligand >= quantile(mean_rank_ligand, 0.75)
+  
+  high_ligand_patients <- colnames(high_celltype)[high_ligand_index]
+  low_ligand_patients <- colnames(high_celltype)[low_ligand_index]
+  
+  # Return just the group assignments
+  sig_patients <- data.frame(
+    cases = c(high_ligand_patients, low_ligand_patients),
+    stratum = rep(c("HIGH", "LOW"), c(length(high_ligand_patients), length(low_ligand_patients)))
+  )
+  
+  return(sig_patients)
+}
+
+calculateSurvivalScore <- function(patient_groups, clinical = clinical_data, showCurve = FALSE, cell_name = "Cell Type", ligand_name = "Ligand") {
+  
+  # Catch the NA returns from the grouping function
+  if (is.na(patient_groups)[1]) return(NA)
+  
+  sig_patients <- merge(patient_groups, clinical, by = 'cases')
+  
+  # Run Kaplan-Meier Analysis
+  ligand_fit <- survminer::surv_fit(Surv(overall_survival, deceased) ~ stratum,
+                                    data = sig_patients)
+  
+  pval <- surv_pvalue(ligand_fit)$pval
+  
+  rmean_high <- summary(ligand_fit, rmean = "common")$table["stratum=HIGH", "rmean"]
+  rmean_low <- summary(ligand_fit, rmean = "common")$table["stratum=LOW", "rmean"]
+  
+  survival_dif <- (rmean_high - rmean_low)
+  
+  # Generate Plot if Requested
+  if (showCurve) {
+    plot(ligand_fit,
+         main = paste0(cell_name, ' and ', paste0(ligand_name, collapse = '_')),
+         xlab = "Time (Days)",
+         ylab = "Survival Probability",
+         col = c("red", "blue"),
+         lwd = 2,
+         xlim = c(0, ceiling(max(sig_patients$overall_survival, na.rm = TRUE) / 500) * 500),
+         mark.time = TRUE)
+    
+    n_val_high <- sum(sig_patients$stratum == "HIGH")
+    n_val_low <- sum(sig_patients$stratum == "LOW")
+    
+    legend("topright", 
+           legend = c(paste0("High ", cell_name, " High ", paste0(ligand_name, collapse = '_'), " (n = ", n_val_high, ")"), 
+                      paste0("High ", cell_name, " Low ", paste0(ligand_name, collapse = '_'), " (n = ", n_val_low, ")")), 
+           col = c("red", "blue"), 
+           lwd = 2)
+    
+    legend("bottomright", 
+           legend = paste("p =", round(pval, 3)),
+           bty = 'n')
+  }
+  
+  return(c(p_value = pval, mean_surv_diff = survival_dif))
+}
+
+LineageLigand <- function(cell_lineage, ligand_name, clinical = clinical_data, showCurve = FALSE, cell_name = "Target Cell") {
+  patient_groups <- getStratifiedPatients(cell_lineage, ligand_name)
+  return(calculateSurvivalScore(patient_groups, clinical, showCurve, cell_name, ligand_name))
+}
+```
+
+```{r Run Lineage Ligand Score}
+LineageLigand(
+  cell_lineage = lineage_markers$Activated.CD8..T.cell, 
+  ligand_name = "CTHRC1",
+  showCurve = TRUE, 
+  cell_name = "Activated CD8 T Cell"
+)
+```
+
+# The Mother of All Commands - All Genes in All Cells
+
+We run the `LineageLigand()` command for select genes in each cell type. Since we're trying to identify ligand receptor interactions between cells, we'll focus on ligand receptor interactions documented in scDiffCom, so we only run our analysis on the genes identified in the scDiffCom database.
+
+```{r Define runAllGenesAllCells Function}
+getStratifiedPatientsFast <- function(high_celltype, ligand_name, bulk_matrix) {
+  # Catch nulls from cell types that didn't have valid markers
+  if (is.null(high_celltype)) return(NA)
+  
+  valid_genes_2 <- intersect(ligand_name, rownames(bulk_matrix))
+  if (length(valid_genes_2) < 1) return(NA)
+  
+  # Rank the subsetted patients purely by ligand expression
+  high_celltype <- high_celltype[valid_genes_2, , drop = FALSE]
+  ranked_ligand <- apply(high_celltype, 1, function(x) rank(-x, ties.method = "first"))
+  mean_rank_ligand <- rowMeans(ranked_ligand)
+  
+  # Identify HIGH and LOW populations
+  high_ligand_index <- mean_rank_ligand <= quantile(mean_rank_ligand, 0.25)
+  low_ligand_index <- mean_rank_ligand >= quantile(mean_rank_ligand, 0.75)
+  
+  high_ligand_patients <- colnames(high_celltype)[high_ligand_index]
+  low_ligand_patients <- colnames(high_celltype)[low_ligand_index]
+  
+  # Return the grouping assignments
+  sig_patients <- data.frame(
+    cases = c(high_ligand_patients, low_ligand_patients),
+    stratum = rep(c("HIGH", "LOW"), c(length(high_ligand_patients), length(low_ligand_patients)))
+  )
+  
+  return(sig_patients)
+}
+
+runAllGenesAllCells <- function() {
+  
+  genes <- intersect(rownames(bulk_counts), unique(na.omit(unlist(lr_network[, 2:6]))))
+  
+  ligand_complex <- lr_network |>
+    filter(!is.na(LIGAND_2)) |>
+    distinct(ligand) |>
+    unlist()
+  
+  receptor_complex <- lr_network |>
+    filter(!is.na(RECEPTOR_2)) |>
+    distinct(receptor) |>
+    unlist()
+  
+  lr_complexes <- unique(c(ligand_complex, receptor_complex))
+  all_targets <- unique(c(genes, lr_complexes))
+  
+  precomputed_lineages <- lapply(colnames(lineage_markers), function(cell) {
+    valid_genes <- intersect(lineage_markers[[cell]], rownames(bulk_counts))
+    if (length(valid_genes) < 1) return(NULL)
+    
+    desired_counts <- bulk_counts[valid_genes, , drop = FALSE]
+    
+    ranked_lineage <- matrixStats::rowRanks(-as.matrix(desired_counts), ties.method = "first")
+    mean_rank <- colMeans(ranked_lineage)
+    
+    high_celltype_index <- mean_rank <= quantile(mean_rank, 0.25)
+    return(bulk_counts[, high_celltype_index, drop = FALSE])
+  })
+  
+  names(precomputed_lineages) <- colnames(lineage_markers)
+  
+  survival.grid <- expand.grid(
+    target = all_targets,
+    cell = colnames(lineage_markers),
+    stringsAsFactors = FALSE
+  )
+  
+  all_results <- mapply(
+    
+    function(target, cell) {
+      
+      high_celltype_df <- precomputed_lineages[[cell]]
+      
+      ligand_name <- str_split(target, "_")[[1]]
+      
+      patient_groups <- getStratifiedPatientsFast(high_celltype = high_celltype_df, 
+                                                  ligand_name = ligand_name, 
+                                                  bulk_matrix = bulk_counts)
+      
+      out <- calculateSurvivalScore(patient_groups, clinical = clinical_data)
+      
+      if (length(out) == 1 && is.na(out)) return(NA)
+      
+      if (out[["p_value"]] <= 0.05) {
+        return((-log10(out[["p_value"]])) * out[["mean_surv_diff"]])
+      } else {
+        return(NA)
+      }
+    },
+    survival.grid$target,
+    survival.grid$cell,
+    SIMPLIFY = TRUE
+  )
+  
+  all_survival <- matrix(
+    all_results,
+    nrow = length(all_targets),
+    ncol = length(colnames(lineage_markers)),
+    dimnames = list(all_targets, colnames(lineage_markers))
+  )
+  
+  return(all_survival)
+}
+```
+
+```{r Run All Genes in All Cells}
+before <- Sys.time()
+survival <- runAllGenesAllCells()
+after <- Sys.time()
+
+print(paste0("Done! This took ", round(after-before,2), " minutes to run!"))
+
+write.csv(survival, file = paste0(cancer, "_all_cells_all_survival.csv"))
+```
+
+# Analysis of Intrinsic versus Extrinsic Genes
+
+Now, our goal is to characterize these genes that we've identified as significant for survival. Are they being produced by the cell, or are they coming from other cells? To evaluate this, we use the single cell RNA data to figure out whether the cells are expressing this gene. If the cells don't express the protein but it still has an effect on survival, we believe that the molecule is being produced by another cell and interacting with this cell as a ligand. If the cell expresses the gene, then we believe that the molecule could be acting as a receptor.
+
+# Identifying Desired Interactions
+
+Our goal is to identify and prioritize ligand-receptor interactions based on our scRNA-seq and survival data.
+
+First, we want to identify all of the possible interactions based on our data. First, we identify all pairs within scDiffCom where the receptor is expressed (\>10% scRNA-seq) while the ligand is not (\<10% scRNA-seq). Then, we identify all cell types that could have sent the ligand (\>10% scRNA-seq) and are significant for survival.
+
+```{r}
+possibleInteractions <- function() {
+  
+  # Pre-extract vector names to avoid repeating lookups inside the loop
+  all_cell_types <- colnames(survival)
+  
+  # Convert to matrices up front to avoid data frame indexing errors
+  pct_mat <- as.matrix(sc_tot_pct_exp)
+  avg_mat <- as.matrix(sc_tot_avg_exp)
+  
+  # Ensure we only check receptors/ligands that actually exist in our data
+  valid_receptors <- intersect(lr_network$receptor, rownames(pct_mat))
+  valid_ligands   <- intersect(lr_network$ligand, rownames(pct_mat))
+  
+  interactions_list <- lapply(all_cell_types, function(cell) {
+    
+    # Identify intrinsic receptors (>= 5%) and extrinsic ligands (< 5%)
+    intrinsic_receptors <- valid_receptors[pct_mat[valid_receptors, cell] >= 0.05]
+    extrinsic_ligands   <- valid_ligands[pct_mat[valid_ligands, cell] < 0.05]
+    
+    # Filter valid interactions for this receiving cell
+    valid_pairs <- lr_network |>
+      filter(ligand %in% extrinsic_ligands & receptor %in% intrinsic_receptors) |>
+      distinct(ligand, receptor)
+    
+    if (nrow(valid_pairs) == 0) return(NULL)
+    
+    unique_ligands <- unique(valid_pairs$ligand)
+    sender_matrix <- pct_mat[unique_ligands, , drop = FALSE] >= 0.05
+    
+    # Map valid senders to each interaction pair
+    int_mat <- valid_pairs |>
+      rowwise() |>
+      reframe(
+        sender = all_cell_types[sender_matrix[ligand, ]],
+        receiver = cell,
+        ligand = ligand,
+        receptor = receptor
+      )
+    
+    if (nrow(int_mat) == 0) return(NULL)
+    
+    int_mat <- int_mat |>
+      mutate(
+        sender_ligand     = survival[cbind(ligand, sender)],
+        receiver_ligand   = survival[cbind(ligand, receiver)],
+        receiver_receptor = survival[cbind(receptor, receiver)],
+        ligand_scaled_exp = as.numeric(avg_mat[cbind(ligand, sender)]),
+        interaction_score = (receiver_ligand + receiver_receptor) / 2,
+        sender_score      = abs(sender_ligand) * ligand_scaled_exp
+      )
+    
+    return(int_mat)
+  })
+  
+  # Combine results into one single data frame
+  unfilt_mat <- bind_rows(interactions_list)
+  
+  return(unfilt_mat)
+}
+
+unfiltered_interactions <- possibleInteractions()
+
+write.csv(unfiltered_interactions, file = paste0(cancer, "_interactions_unfiltered.csv"))
+```
+
+Then, we filter this large matrix of interactions. First, we want to make sure that all three are significant for survival and that their impact on survival is consistent across the different interactions (sender x ligand, receiver x ligand, receiver x receptor). Finally, we want to filter out biomarkers, which are genes that are significant regardless of cell type (as defined by genes significant in \>2/3 of cell types).
+
+```{r}
+filteredInteractions <- function(unfilt_mat) {
+  
+  # Make sure all three are significant for survival
+  not_sig <- apply(unfilt_mat, 1, function(row) sum(is.na(row)) == 0)
+  sig_mat <- unfilt_mat[not_sig,]
+  
+  # Make sure all three are in same direction
+  directions <- abs(sign(sig_mat$sender_ligand) + sign(sig_mat$receiver_ligand) + sign(sig_mat$receiver_receptor)) == 3
+  sig_mat_2 <- sig_mat[directions, ]
+  
+  # Biomarkers
+  biomarkers <- row.names(survival)[rowSums(!is.na(survival)) > (ncol(survival)*0.67)]
+  final_sig_mat <- sig_mat_2 |>
+    filter(!ligand %in% biomarkers & !receptor %in% biomarkers)
+  
+  return(final_sig_mat)
+}
+
+filtered_interactions <- filteredInteractions(unfiltered_interactions)
+
+write.csv(filtered_interactions, file = paste0(cancer, "_interactions_filtered.csv"))
+```
+
+# Permutation Test
+
+The last test is to run a permutation test. Given the large number of interactions that we screen through on the same data, we are likely to have false positives at the rate p (since p is the rate of false positives). To address this, we run a permutation test - if we were to shuffle the data, would the phenotype we are seeing still hold? If so, it is likely real, and if not, then it was likely a false positive.
+
+```{r Permutation Test}
+permutationTest <- function(gene_list1, gene_list2, npermute = 1000) {
+  
+  # 1. Evaluate RNA-seq grouping ONCE outside the loop
+  patient_groups <- getStratifiedPatients(gene_list1, gene_list2)
+  if (is.na(patient_groups)[1]) return(NA)
+  
+  # 2. Observed Score
+  obs <- calculateSurvivalScore(patient_groups, clinical_data)
+  if (length(obs) == 1 && is.na(obs)) return(NA)
+  obs_score <- -log10(obs["p_value"]) * obs["mean_surv_diff"]
+  
+  # 3. Permutations
+  F_emp <- numeric(npermute)
+  
+  for (i in 1:npermute) {
+    shuffled_clinical <- clinical_data
+    shuffled_clinical$cases <- sample(shuffled_clinical$cases)
+    
+    emp <- calculateSurvivalScore(patient_groups, shuffled_clinical)
+    F_emp[i] <- -log10(emp["p_value"]) * emp["mean_surv_diff"]
+  }
+  
+  # Two-tailed p value
+  return(mean(c(abs(F_emp) >= abs(obs_score), TRUE)))
+  
+}
+```
+
+Now, we run the permutation test on all of the relevant cell types and genes that were identified in the original prioritized matrix.
+
+```{r}
+# Permute Interactions
+permuteInteractions <- function(int_permute) {
+
+  # Cell Types & Genes
+  cell_types <- unique(c(int_permute$sender, int_permute$receiver))
+  genes <- unique(c(int_permute$ligand, int_permute$receptor))
+  
+  permutation.grid <- expand.grid(
+    gene = genes,
+    cell = cell_types,
+    stringsAsFactors = FALSE
+  )
+  
+  nThreads <- detectCores() - 4
+  clusterOfThreads <- makeCluster(nThreads, timeout = 10800) 
+  
+  clusterExport(
+    cl = clusterOfThreads, 
+    varlist = c("permutationTest", "getStratifiedPatients", "calculateSurvivalScore", 
+                "lineage_markers", "clinical_data", "bulk_counts")
+  )
+  
+  clusterEvalQ(clusterOfThreads, {
+    library(survival)
+    library(survminer)
+    library(matrixStats)
+    library(tidyverse)
+  })
+  
+  before <- Sys.time()
+  perm_vector <- clusterMap(
+    cl = clusterOfThreads,
+    fun = function(gene, cell) {
+      permutationTest(
+        gene_list1 = lineage_markers[[cell]],
+        gene_list2 = stringr::str_split(gene, "_")[[1]]
+      )
+    },
+    permutation.grid$gene,
+    permutation.grid$cell,
+    SIMPLIFY = TRUE
+  )
+  after <- Sys.time()
+  print(after - before)
+  
+  stopCluster(clusterOfThreads)
+  
+  perm_mat <- matrix(
+    perm_vector <= 0.05,
+    nrow = length(genes),
+    ncol = length(cell_types),
+    dimnames = list(genes, cell_types)
+  )
+  
+  filter <- logical(nrow(int_permute))
+  
+  for (i in 1:nrow(int_permute)) {
+    temp <- int_permute[i,]
+    filter[i] <- perm_mat[temp$ligand, temp$sender] &
+      perm_mat[temp$ligand, temp$receiver] &
+      perm_mat[temp$receptor, temp$receiver]
+  }
+  
+  int_permute <- int_permute[filter,]
+  
+  return(int_permute)
+}
+
+permuted_interactions <- permuteInteractions(filtered_interactions)
+
+write.csv(permuted_interactions, file = paste0(cancer, "_prioritized_permuted.csv"))
+```

@@ -1,0 +1,195 @@
+---
+title: "scRNA Expression"
+lastupdated: "08-31-2026"
+---
+
+```{r Libraries, include = FALSE}
+library(Seurat)
+library(tidyverse)
+library(harmony)
+```
+
+```{r Seurat Analysis Functions}
+SeuratAnalysis1 <- function(SeuratObject){
+  SeuratObject <- NormalizeData(SeuratObject)
+  SeuratObject <- FindVariableFeatures(SeuratObject)
+  SeuratObject <- ScaleData(SeuratObject)
+  SeuratObject <- RunPCA(SeuratObject, features = VariableFeatures(SeuratObject))
+  return(SeuratObject)
+}
+
+SeuratHarmony <- function(SeuratObject, harmony.by, res = 0.5, n){
+  SeuratObject <- RunHarmony(SeuratObject, group.by.vars = harmony.by)
+  SeuratObject <- FindNeighbors(SeuratObject, dims = 1:n, reduction = "harmony")
+  SeuratObject <- FindClusters(SeuratObject, resolution = res)
+  SeuratObject <- RunUMAP(SeuratObject, dims = 1:n, reduction = "harmony")
+  return(SeuratObject)
+}
+```
+
+# Loading Data
+First, let's load in the data. You should load in an annotated Seurat object as an RDS. The cell type annotations should be found in the metadata under `celltype`; if stored under any other variable (e.g., `celltype.v2`), make sure to set celltype to equal the other variable.
+
+```{r Initialize}
+cancer <- 'LIHC'
+
+data <- readRDS(paste0(cancer, '_final.rds'))
+
+data <- SeuratAnalysis1(data)
+data <- SeuratHarmony(data, harmony.by = 'Patient', n = 7)
+
+common_cells <- read.csv('Common_Lineage_Markers.csv')
+```
+
+# Extracting Lineage Markers
+We need to extract the top 50 lineage markers per cell type for SKYNET. For cell types that are present in the merged object, we will use the merged object lineage markers. We have a list of cell types that are assumed to be found across all tissues; even if they aren't picked up in the scRNA-seq, we assume that bulk RNA-seq has a higher resolution and thus a better ability to pick up these cell types. For cell types that are only present in this specific tissue, we will extract those specific lineage markers separately.
+
+```{r Lineage Markers}
+celltypes <- unique(data$celltype)
+
+# Cell Type Specific
+specific <- celltypes[!celltypes %in% colnames(common_cells)]
+specific_markers <- vapply(specific, function(x) FindMarkers(data, ident.1 = x, min.pct = 0.25, only.pos = T, group.by = 'celltype') %>% arrange(desc(avg_log2FC)) %>% row.names() %>% head(20), character(20))
+
+write.csv(cbind(common_cells, specific_markers),
+          file = paste0(cancer, '_Lineage_Markers.csv'), row.names = FALSE)
+```
+
+# Cell Type Expression
+
+# Filter scDiffCom
+First, we want to make sure that all of the genes from scDiffCom are present in our scRNA-seq data. If not, we won't analyze the interaction.
+``` {r}
+lr_network <- readRDS("lr_scdiffcom_v2.RDS")
+
+# Check each row and make sure all referenced genes are in scRNA data
+filter <- apply(lr_network, MARGIN = 1, function(row) {
+  all(is.na(row[2:6]) | row[2:6] %in% row.names(data))
+})
+
+mean(filter) # percent of interactions with all genes present in scRNA-seq
+
+lr_network <- lr_network[filter,]
+```
+
+# Extract Counts
+Next, we want to minimize computational operations by only looking at our genes of interest (any genes involved with ligand-receptor interactions according to scDiffCom).
+``` {r}
+# Only genes in LR Network
+genes <- unlist(lr_network[, 2:6])
+genes <- unique(genes[!is.na(genes)])
+
+# Extract raw counts
+counts <- FetchData(data, assay = "RNA", vars = genes, layer = "data")
+
+# data$celltype is lookup table for ident
+cell_map <- data$celltype
+```
+
+# Identify Complexes
+Now, we generate a list of all of the complexes (two or more genes in the receptor and/or ligand).
+``` {r}
+# Identify complexes
+lr_network <- as.data.frame(lr_network) |>
+  mutate(ligand = apply(across(2:3), 1, function(row) {
+    str_c(sort(na.omit(row)), collapse = "_")
+  })) |>
+  mutate(receptor = apply(across(4:6), 1, function(row) {
+    str_c(sort(na.omit(row)), collapse = "_")
+  }))
+
+# Ligand complexes
+ligand_complex <- lr_network |>
+  filter(!is.na(LIGAND_2)) |>
+  distinct(ligand) |>
+  unlist()
+
+# Receptor complexes
+receptor_complex <- lr_network |>
+  filter(!is.na(RECEPTOR_2)) |>
+  distinct(receptor) |>
+  unlist()
+
+# All unique complexes
+all_complexes <- unique(c(ligand_complex, receptor_complex))
+```
+
+# Percent Expression
+Now, we calculate the percent expression. For the single gene, we find the percentage of cells that express that gene above 0. For complexes, we find the percentage of cells that express all genes within the complex above 0.
+``` {r}
+# Single Gene
+pct_single_by_cell <- lapply(unique(cell_map), function(ident) {
+  cells <- counts[cell_map == ident, , drop = FALSE]
+  pct.exp <- vapply(cells, FUN = PercentAbove, threshold = 0, numeric(1))
+})
+
+names(pct_single_by_cell) <- unique(cell_map)
+
+pct_single <- do.call(cbind, pct_single_by_cell)
+
+# Complexes
+pct_complex_by_cell <- lapply(unique(cell_map), function(ident) {
+  cells <- counts[cell_map == ident, ]
+  pct.exp <- vapply(all_complexes, function(complex) {
+    indiv <- str_split(complex, pattern = "_")[[1]]
+    mean(apply(cells[, indiv], MARGIN = 1, prod) > 0)
+  }, numeric(1))
+})
+
+names(pct_complex_by_cell) <- unique(cell_map)
+
+pct_complex <- do.call(cbind, pct_complex_by_cell)
+
+# Combined expression matrix
+tot_pct_exp <- rbind(pct_single, pct_complex)
+
+write.csv(tot_pct_exp, file = paste0(cancer, '_pct_exp.csv'))
+```
+
+# Average Expression
+We then calculate the average expression in the same way that Seurat does in AverageExpression(). Since layer = "data" stores log-normalized data, we remove the log normalization through expm1 (e^x-1). We then calculate the average, then renormalize the average. Finally, we scale the averages for each gene.
+``` {r}
+# Single Gene
+avg_single_by_cell <- lapply(unique(cell_map), function(ident) {
+  cells <- counts[cell_map == ident, ]
+  avg.exp <- vapply(cells, function(x) mean(expm1(x)), numeric(1))
+})
+
+names(avg_single_by_cell) <- unique(cell_map)
+
+avg_single <- do.call(cbind, avg_single_by_cell)
+
+# Complex
+avg_complex_by_cell <- lapply(unique(cell_map), function(ident) {
+  cells <- counts[cell_map == ident, ]
+  avg.exp <- vapply(all_complexes, function(complex) {
+    indiv <- str_split(complex, pattern = "_")[[1]]
+    
+    # Filter for cells that express all genes
+    temp_cells <- cells[, indiv]
+    filter <- apply(temp_cells, MARGIN = 1, prod) > 0
+    
+    # Calculate complex co-expression levels (mean of two) - if all genes are expressed, takes the average of the expressions of each gene; else, 0 (since it's not coexpressed)
+    expr <- ifelse(filter, apply(temp_cells, 1, function(x) mean(expm1(x))), 0)
+    
+    mean(expr)
+  }, numeric(1))
+})
+
+names(avg_complex_by_cell) <- unique(cell_map)
+
+avg_complex <- do.call(cbind, avg_complex_by_cell)
+
+# Combined expression matrix
+tot_avg_exp <- rbind(avg_single, avg_complex)
+tot_avg_exp[tot_avg_exp == 0] <- NA
+
+# Scale
+tot_scaled_avg_exp <- t(apply(tot_avg_exp, MARGIN = 1, function(x) {
+  scale(log1p(x))
+}))
+
+colnames(tot_scaled_avg_exp) <- unique(cell_map)
+
+write.csv(tot_scaled_avg_exp, file = paste0(cancer, '_avg_exp.csv'))
+```

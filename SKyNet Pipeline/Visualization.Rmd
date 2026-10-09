@@ -1,0 +1,523 @@
+---
+title: "SKYNET Ligand Receptor Analysis Visualization"
+lastupdated: "08-31-2026"
+---
+
+```{r Setup, include = FALSE}
+library(tidyverse)
+library(pheatmap)
+library(grid)
+library(circlize)
+library(ComplexHeatmap)
+library(ggraph)
+library(tidygraph)
+library(ggnewscale)
+
+# Global Parameters
+cancer <- "LIHC"
+```
+
+# Plot Time
+
+Now it's time to plot our interactions!
+
+```{r Load Data}
+interactions <- read.csv(paste0(cancer, "_prioritized_permuted.csv"), row.names = 1)
+
+plot_data <- interactions |>
+  # Select top sender per triad
+  group_by(ligand, receptor, receiver) |>
+  slice_max(sender_score, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  # Aggregate across receptors
+  group_by(receiver, ligand, sender) |>
+  summarise(
+    sender_ligand = dplyr::first(abs(sender_ligand)),
+    sum_interaction = sum(interaction_score, na.rm = TRUE),
+    top_receptor = receptor[which.max(abs(interaction_score))],
+    top_interaction = max(abs(interaction_score)),
+    direction = if_else(
+      interaction_score[which.max(abs(interaction_score))] > 0,
+      "Increased Survival", 
+      "Decreased Survival"
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(
+    sender_ligand_pair = paste(ligand, sender, sep = "+"),
+    label = paste(sender, receiver, ligand, top_receptor, sep = "+")
+  )
+
+sender_colors2 <- c(
+  "dodgerblue3", "red", "goldenrod2", "darkorchid4", "seagreen1",
+  "firebrick", "mediumblue", "darkorange3", "turquoise2", "springgreen4",
+  "darkcyan", "chartreuse3", "slateblue3", "mediumvioletred", "tan4",
+  "yellow", "magenta", "black", "lavender", "mediumorchid3",
+  "steelblue3", "moccasin", "coral", "olivedrab", "lightslateblue",
+  "cornsilk4", "azure3", "bisque3", "cadetblue4", "chocolate4", "darkolivegreen",
+  "darkslategray", "hotpink4", "honeydew", "khaki3", "lightsalmon2", "seashell",
+  "thistle2", "plum4", "royalblue1", "orangered2", "forestgreen",
+  "darkgoldenrod1", "purple3", "cyan3", "indianred3", "navy", "darkmagenta",
+  "chartreuse1", "mediumturquoise", "tomato3", "gold3", "darkseagreen4",
+  "dodgerblue4", "sienna3", "darkred", "skyblue2", "violetred1", "darkslateblue",
+  "palegreen3", "salmon3", "lightcoral", "mediumseagreen", "blue4",
+  "mediumspringgreen", "slategray3", "mediumslateblue", "orange4", "darkkhaki"
+)
+```
+
+# All Interactions Graph
+
+```{r Plot All Interactions}
+# Data Prep & Limits
+plot_data_all <- plot_data |>
+  mutate(abs_sum_interaction = abs(sum_interaction))
+
+raw_breaks <- pretty(plot_data_all$abs_sum_interaction, n = 5)
+raw_breaks <- raw_breaks[raw_breaks > 0]
+n_breaks <- length(raw_breaks)
+
+dynamic_breaks <- c(raw_breaks, raw_breaks + 0.1)
+dynamic_labels <- as.character(c(raw_breaks, raw_breaks))
+dynamic_shapes <- c(rep(16, n_breaks), rep(15, n_breaks))
+dynamic_limits <- c(
+  min(c(raw_breaks, plot_data_all$abs_sum_interaction), na.rm = TRUE),
+  max(c(dynamic_breaks, plot_data_all$abs_sum_interaction), na.rm = TRUE)
+)
+
+# Plot Generation
+p_all <- ggplot(plot_data_all, aes(x = sender_ligand_pair)) +
+  geom_point(aes(y = receiver, size = abs_sum_interaction, color = top_receptor, shape = direction)) +
+  geom_tile(aes(y = -0.5, fill = abs(sender_ligand)), width = 0.4, height = 0.4, color = "grey") +
+  scale_color_manual(name = "Receptor", values = sender_colors2) +
+  scale_shape_manual(name = "Outcome", values = c(16, 15)) +
+  scale_fill_gradient(name = "Sender Score", low = "white", high = "red") +
+  scale_size_continuous(
+    name = "Interaction Score",
+    range = c(1, 10),
+    limits = dynamic_limits,
+    breaks = dynamic_breaks,
+    labels = dynamic_labels,
+    guide = guide_legend(
+      ncol = 2,
+      byrow = FALSE,
+      override.aes = list(shape = dynamic_shapes, color = "black")
+    )
+  ) +
+  labs(
+    title = paste0("Ligand/receptor pairs associated with significant survival in ", cancer),
+    x = "Ligand",
+    y = "Receiver"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    panel.grid = element_blank(),
+    plot.margin = margin(10, 10, 50, 10)
+  ) +
+  guides(fill = guide_colorbar(order = 1)) +
+  coord_cartesian(clip = "off")
+
+print(p_all)
+
+ggsave(
+  filename = paste0(cancer, "_all_interactions.pdf"),
+  plot = p_all,
+  units = "in", dpi = 300, height = 15, width = 15
+)
+```
+
+# Direction-Specific Interactions
+
+```{r Helper Plotting Function}
+# Helper to reduce duplication across direction plots
+plot_interaction_subset <- function(data, target_direction, shape_val, title_text) {
+  filtered_data <- data |> filter(direction == target_direction)
+  sender_dots <- filtered_data |> select(sender, ligand, sender_ligand, sender_ligand_pair)
+
+  ggplot(filtered_data, aes(x = sender_ligand_pair, y = receiver)) +
+    geom_point(aes(size = abs(sum_interaction), color = top_receptor), shape = shape_val) +
+    scale_color_manual(values = sender_colors2, name = "Receptor") +
+    scale_size_continuous(name = "Interaction Score", range = c(1, 10)) +
+    theme_minimal() +
+    labs(title = title_text, x = "Ligand", y = "Receiver") +
+    theme(
+      axis.text.x = element_text(angle = 90, hjust = 1),
+      panel.grid = element_blank(),
+      plot.margin = margin(10, 10, 50, 10),
+      axis.line.x = element_line(color = "black"),
+      axis.line.y = element_line(color = "black"),
+      axis.ticks = element_line(color = "black")
+    ) +
+    coord_cartesian(clip = "off") +
+    ggnewscale::new_scale("size") +
+    geom_tile(
+      data = sender_dots,
+      aes(x = sender_ligand_pair, y = -0.5, fill = abs(sender_ligand)),
+      width = 0.4, height = 0.4, color = "grey", inherit.aes = FALSE
+    ) +
+    scale_fill_gradient(name = "Sender Score", low = "white", high = "red") +
+    guides(fill = guide_colorbar(order = 1))
+}
+```
+
+```{r Plot Good & Bad Interactions}
+# 1. Increased Survival Plots
+p_good <- plot_interaction_subset(
+  data = plot_data,
+  target_direction = "Increased Survival",
+  shape_val = 15,
+  title_text = paste0("Ligand/receptor pairs associated with increased survival in ", cancer)
+)
+print(p_good)
+
+ggsave(
+  filename = paste0(cancer, "_good_interactions.pdf"), 
+  plot = p_good, units = "in", dpi = 300, height = 15, width = 15
+)
+
+# 2. Decreased Survival Plots
+p_bad <- plot_interaction_subset(
+  data = plot_data,
+  target_direction = "Decreased Survival",
+  shape_val = 16,
+  title_text = paste0("Ligand/receptor pairs associated with decreased survival in ", cancer)
+)
+print(p_bad)
+
+ggsave(
+  filename = paste0(cancer, "_bad_interactions.pdf"), 
+  plot = p_bad, units = "in", dpi = 300, height = 15, width = 15
+)
+```
+
+# Circle Plot (Chord Diagram)
+
+A chord diagram of all of the interactions between cell types. Relationship strength is denoted by thickness and direction by color. This code does not work in RMarkdown, so paste into R console to run.
+
+```{r Chord Diagram Plot}
+# Edge List & Dynamic Colors
+edges <- interactions |>
+  group_by(sender, receiver) |>
+  summarize(value = sum(interaction_score, na.rm = TRUE), .groups = "drop") |>
+  filter(value != 0) |>
+  rename(from = sender, to = receiver)
+
+present_cells <- sort(unique(c(edges$from, edges$to)))
+cell_colors <- setNames(sender_colors2[seq_along(present_cells)], present_cells)
+
+# Color Mapping & Legend Breaks
+max_abs <- max(abs(edges$value))
+col_fun <- colorRamp2(c(-max_abs, 0, max_abs), c("blue", "white", "red"))
+
+breaks <- pretty(c(-max_abs, max_abs), n = 5)
+range_limit <- max(abs(breaks))
+breaks <- pretty(c(-range_limit, range_limit), n = 5)
+
+# Render Plot
+pdf(paste0(cancer, "_chord_diagram.pdf"), width = 15, height = 15)
+
+circos.clear()
+circos.par(
+  canvas.xlim = c(-0.9, 1.7),
+  canvas.ylim = c(-1.3, 1.3),
+  gap.after = 2
+)
+
+chordDiagram(
+  edges,
+  grid.col = cell_colors,
+  transparency = 0.5,
+  annotationTrack = "grid",
+  preAllocateTracks = list(track.height = 0.1),
+  col = col_fun(edges$value),
+  directional = 1,
+  direction.type = "arrows",
+  link.arr.type = "big.arrow",
+  link.sort = TRUE,
+  link.largest.ontop = TRUE
+)
+
+# Draw Legend
+packed_lgd <- packLegend(
+  Legend(
+    col_fun = col_fun,
+    title = "Interaction\nStrength",
+    at = breaks,
+    direction = "vertical",
+    title_gp = gpar(fontsize = 18, fontface = "bold"),
+    labels_gp = gpar(fontsize = 16),
+    title_gap = unit(4, "mm")
+  ),
+  Legend(
+    labels = present_cells,
+    legend_gp = gpar(fill = cell_colors[present_cells]),
+    title = "Cell Types",
+    ncol = 1,
+    title_gp = gpar(fontsize = 18, fontface = "bold"),
+    labels_gp = gpar(fontsize = 16),
+    title_gap = unit(2, "mm")
+  ),
+  direction = "vertical",
+  gap = unit(1, "cm")
+)
+
+draw(packed_lgd, x = unit(0.75, "npc"), y = unit(0.5, "npc"), just = c("left", "center"))
+
+dev.off()
+circos.clear()
+```
+
+# Number of Interactions
+
+We look to map the number of interactions between each pair of cells.
+
+```{r Number of Interactions}
+# Construct Symmetric Contingency Matrix
+cell_types <- sort(unique(c(interactions$sender, interactions$receiver)))
+counts <- table(
+  factor(interactions$sender, levels = cell_types),
+  factor(interactions$receiver, levels = cell_types)
+)
+
+result_matrix <- as.matrix(counts) + t(as.matrix(counts))
+
+# Heatmap Colors & Formatting
+ramp <- colorRampPalette(c("white", "darkred"))
+n_colors <- max(result_matrix) - min(result_matrix)
+mr <- ramp(n_colors + 1)
+
+breaks <- seq(min(result_matrix) - 0.5, max(result_matrix) + 0.5, length.out = n_colors + 2)
+legend_breaks <- min(result_matrix):max(result_matrix)
+
+# Plot
+p_heatmap <- pheatmap::pheatmap(
+  result_matrix, 
+  labCol = NA, 
+  color = mr, 
+  scale = "none", 
+  na_col = "grey",
+  fontsize_col = 7, 
+  fontsize_row = 7, 
+  fontsize = 10, 
+  border_color = "lightgrey", 
+  show_rownames = TRUE, 
+  show_colnames = TRUE, 
+  cluster_rows = FALSE, 
+  cluster_cols = FALSE,
+  main = paste0("Number of Interactions Between Cells in ", cancer),
+  display_numbers = FALSE, 
+  breaks = breaks, 
+  legend = TRUE, 
+  legend_breaks = legend_breaks,
+  legend_labels = as.character(legend_breaks)
+)
+
+ggsave(
+  filename = paste0(cancer, "_num_interactions.pdf"), 
+  plot = p_heatmap, units = "in", dpi = 300, height = 8, width = 8
+)
+```
+
+# Sum of Interaction Scores
+
+```{r Sum Interactions Barplot}
+# Data Processing
+plot_data_sums <- interactions |>
+  pivot_longer(cols = c(sender, receiver), names_to = "role", values_to = "node") |>
+  summarize(score = sum(interaction_score, na.rm = TRUE), .by = c(node, role)) |>
+  ungroup() |>
+  complete(node, role, fill = list(score = 0)) |>
+  mutate(total = sum(score), .by = node) |>
+  filter(dense_rank(-total) <= 5 | dense_rank(total) <= 5) |>
+  mutate(
+    node = fct_reorder(node, total, .desc = TRUE),
+    role = factor(role, levels = c("sender", "receiver"))
+  ) |>
+  select(-total)
+
+# Plot Generation
+plot_bars <- ggplot(plot_data_sums, aes(x = node, y = score, fill = role)) +
+  geom_hline(yintercept = 0, color = "gray", linetype = "dashed") +
+  geom_col(
+    position = position_dodge(width = 0.8, preserve = "single"), 
+    width = 0.7, alpha = 0.8, color = "black", linewidth = 0.8
+  ) +
+  scale_fill_manual(
+    values = c(sender = "#0072B2", receiver = "#D55E00"),
+    labels = c(
+      sender = "Sum Interaction Score as Sender",
+      receiver = "Sum Interaction Score as Receiver"
+    )
+  ) +
+  scale_y_continuous(labels = scales::label_number(big.mark = "")) +
+  labs(x = NULL, y = "Total Interaction Score", fill = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top",
+    plot.margin = margin(10, 15, 10, 10)
+  )
+
+print(plot_bars)
+
+ggsave(
+  filename = paste0(cancer, "_sum_interaction_bars.pdf"), 
+  plot = plot_bars, width = 10, height = 6, dpi = 300
+)
+```
+
+# Zooming In On One Cell
+
+```{r Single Cell Network Function}
+makeSingleCellLRPlot <- function(interactions, target_cell, cell_colors = sender_colors2) {
+  
+  incoming <- interactions |> filter(receiver == target_cell)
+  outgoing <- interactions |> filter(sender == target_cell)
+  
+  edges <- bind_rows(
+    incoming |> transmute(
+      from = paste0(sender, "_L_", ligand, "_1"),
+      to   = paste0(target_cell, "_R_", receptor, "_2"),
+      value = interaction_score
+    ),
+    outgoing |> transmute(
+      from = paste0(target_cell, "_L_", ligand, "_2"),
+      to   = paste0(receiver, "_R_", receptor, "_3"),
+      value = interaction_score
+    )
+  )
+  
+  nodes <- bind_rows(
+    incoming |> distinct(clean_label = ligand, cell_type = sender) |> mutate(id = paste0(cell_type, "_L_", clean_label, "_1"), node_x = 1),
+    incoming |> distinct(clean_label = receptor, cell_type = receiver) |> mutate(id = paste0(cell_type, "_R_", clean_label, "_2"), node_x = 2),
+    outgoing |> distinct(clean_label = ligand, cell_type = sender) |> mutate(id = paste0(cell_type, "_L_", clean_label, "_2"), node_x = 2),
+    outgoing |> distinct(clean_label = receptor, cell_type = receiver) |> mutate(id = paste0(cell_type, "_R_", clean_label, "_3"), node_x = 3)
+  ) |> distinct(id, .keep_all = TRUE)
+  
+  graph <- tbl_graph(nodes = nodes, edges = edges, node_key = "id") |>
+    arrange(node_x, clean_label) |>
+    group_by(node_x) |>
+    mutate(node_y = row_number()) |>
+    ungroup() |>
+    mutate(
+      node_y = node_y - (max(node_y[node_x == 2]) / 2) + (max(node_y) / 2),
+      label_x = case_when(node_x == 1 ~ node_x - 0.15, node_x == 3 ~ node_x + 0.15, TRUE ~ node_x),
+      label_y = case_when(node_x == 2 ~ node_y + 0.35, TRUE ~ node_y),
+      label_hjust = case_when(node_x == 1 ~ 1, node_x == 3 ~ 0, TRUE ~ 0.5)
+    )
+  
+  max_y <- max(as_tibble(graph)$node_y)
+  
+  ggraph(graph, layout = "manual", x = node_x, y = node_y) +
+    geom_edge_diagonal(aes(edge_width = abs(value), color = factor(sign(value))), alpha = 0.4) +
+    scale_edge_color_manual(
+      values = c("-1" = "blue", "1" = "red"),
+      labels = c("-1" = "Decreased Survival", "1" = "Increased Survival"),
+      name = "Interaction Direction"
+    ) +
+    scale_edge_width(range = c(0.2, 2), name = "Interaction Strength") +
+    geom_node_point(aes(color = cell_type), size = 6) +
+    scale_color_manual(values = cell_colors, name = "Cell Type") +
+    geom_node_text(aes(x = label_x, y = label_y, label = clean_label, hjust = label_hjust), size = 3) +
+    annotate(
+      "text", x = 1:3, y = max_y + 1.5, 
+      label = c("Senders\n(Ligands)", paste0(target_cell, "\n(Receptors & Ligands)"), "Receivers\n(Receptors)"), 
+      fontface = "bold", size = 4.5
+    ) +
+    theme_void() +
+    theme(
+      legend.box.spacing = unit(0.2, "cm"),
+      legend.margin = margin(0, 0, 0, 0),
+      plot.margin = margin(10, 10, 10, 10)
+    ) +
+    coord_cartesian(clip = "off") + 
+    expand_limits(x = c(0.8, 3.4), y = c(0, max_y + 2))
+}
+
+# Execution
+target_cell <- "Lymphatic.endothelial"
+p_single <- makeSingleCellLRPlot(interactions = interactions, target_cell = target_cell, cell_colors = sender_colors2)
+print(p_single)
+
+ggsave(
+  filename = paste0(cancer, "_", target_cell, "_single_cell_lr_plot.pdf"), 
+  plot = p_single, width = 10, height = 10, dpi = 300, units = "in"
+)
+```
+
+# Zooming In Two Cell Types
+
+```{r Cell Pair Network Function}
+makeCellPairLRPlot <- function(interactions, cell1, cell2) {
+  
+  interactions_temp <- interactions |>
+    filter(
+      (sender == cell1 & receiver == cell2) | 
+      (sender == cell2 & receiver == cell1)
+    )
+  
+  edges_bipartite <- interactions_temp |>
+    transmute(
+      from = paste0(ligand, "_L"),
+      to   = paste0(receptor, "_R"),
+      value = interaction_score
+    )
+  
+  node_metadata <- bind_rows(
+    interactions_temp |> select(name_raw = ligand, cell_type = sender) |> distinct() |> mutate(name = paste0(name_raw, "_L")),
+    interactions_temp |> select(name_raw = receptor, cell_type = receiver) |> distinct() |> mutate(name = paste0(name_raw, "_R"))
+  )
+  
+  graph <- as_tbl_graph(edges_bipartite) |>
+    activate(nodes) |>
+    left_join(node_metadata, by = "name") |>
+    mutate(
+      x = if_else(str_detect(name, "_L$"), 1, 2),
+      clean_label = str_remove(name, "_[LR]$")
+    ) |>
+    arrange(clean_label) |>
+    group_by(x) |>
+    mutate(y = row_number()) |>
+    ungroup()
+  
+  max_y <- max(as_tibble(graph)$y)
+  x_coords <- pull(as_tibble(graph), x)
+  
+  ggraph(graph, layout = "manual", x = x, y = y) +
+    geom_edge_diagonal(aes(edge_width = abs(value), color = factor(sign(value))), alpha = 0.4) +
+    scale_edge_color_manual(
+      values = c("-1" = "blue", "1" = "red"),
+      labels = c("-1" = "Decreased Survival", "1" = "Increased Survival"),
+      name = "Interaction Direction"
+    ) +
+    scale_edge_width(range = c(0.2, 2), name = "Interaction Strength") + 
+    geom_node_point(aes(color = cell_type), size = 6) +
+    scale_color_manual(
+      values = setNames(c("#E69F00", "#56B4E9"), c(cell1, cell2)),
+      name = "Cell Type"
+    ) +
+    geom_node_text(
+      aes(label = clean_label),
+      nudge_x = if_else(x_coords == 1, -0.15, 0.15),
+      hjust = if_else(x_coords == 1, 1, 0),
+      size = 3
+    ) +
+    annotate("text", x = 1, y = max_y + 1, label = "Ligand", fontface = "bold", size = 5) +
+    annotate("text", x = 2, y = max_y + 1, label = "Receptor", fontface = "bold", size = 5) +
+    theme_void() +
+    expand_limits(x = c(0.5, 2.5), y = c(1, max_y + 1.5))
+  
+  ggsave(filename = paste0(cancer, '_', cell1, '_', cell2, '.pdf'), dpi = 300, width = 6, height = 8)
+}
+
+# Execution
+p_pair <- makeCellPairLRPlot(
+  interactions = interactions, 
+  cell1 = "Lymphatic.endothelial", 
+  cell2 = "Neutrophil"
+)
+```
